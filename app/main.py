@@ -6,7 +6,7 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from .planner import plan_moves
+from .planner import SearchLimitReached, plan_moves
 from .schemas import (
     ErrorEnvelope,
     PlanRequest,
@@ -33,6 +33,22 @@ async def semantic_error_handler(_: Request, exc: SemanticError) -> JSONResponse
     return JSONResponse(
         status_code=422,
         content={"detail": [{"code": exc.code, "message": exc.message}]},
+    )
+
+
+@app.exception_handler(SearchLimitReached)
+async def search_limit_handler(_: Request, exc: SearchLimitReached) -> JSONResponse:
+    # 搜索耗尽安全状态上限：既未证最优也未证无解，不能按 feasible=false 返回。
+    return JSONResponse(
+        status_code=503,
+        content={
+            "detail": [
+                {
+                    "code": "SEARCH_LIMIT_REACHED",
+                    "message": "搜索状态数超出安全上限，未能在资源限额内给出已证最优的规划结果",
+                }
+            ]
+        },
     )
 
 
@@ -65,7 +81,10 @@ async def health() -> dict[str, str]:
 @app.post(
     "/plans",
     response_model=PlanResponse,
-    responses={422: {"model": ErrorEnvelope}},
+    responses={
+        422: {"model": ErrorEnvelope},
+        503: {"model": ErrorEnvelope},
+    },
     summary="生成区段安全搬移序列",
 )
 async def create_plan(req: PlanRequest) -> PlanResponse:

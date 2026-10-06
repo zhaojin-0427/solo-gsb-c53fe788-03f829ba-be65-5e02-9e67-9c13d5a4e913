@@ -204,6 +204,53 @@ def test_422_when_capacity_exceeds_uint64_coordinate_space():
     assert r.status_code == 422
 
 
+def test_rotation_12_segments_borrow_temp_slot():
+    # 容量 13：ID "0".."11" 的长度 1 区段位于同号位置，目标 (i+1)%12，
+    # 位置 12 空闲。可借临时空位 13 步归位，不得误报无解。
+    r = post(
+        {
+            "capacity": 13,
+            "segments": [
+                {
+                    "id": str(i),
+                    "current_start": i,
+                    "length": 1,
+                    "target_start": (i + 1) % 12,
+                }
+                for i in range(12)
+            ],
+        }
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["feasible"] is True
+    moves = [(m["segment_id"], m["destination_start"]) for m in body["moves"]]
+    assert moves == [
+        ("0", 12), ("11", 0), ("10", 11), ("9", 10), ("8", 9),
+        ("7", 8), ("6", 7), ("5", 6), ("4", 5), ("3", 4),
+        ("2", 3), ("1", 2), ("0", 1),
+    ]
+    assert all(m["length"] == 1 for m in body["moves"])
+
+
+def test_503_when_search_limit_reached(monkeypatch):
+    from app import planner
+
+    monkeypatch.setattr(planner, "_MAX_SEARCH_STATES", 1)
+    r = post(
+        {
+            "capacity": 5,
+            "segments": [
+                {"id": "A", "current_start": 0, "length": 2, "target_start": 2},
+                {"id": "B", "current_start": 2, "length": 1, "target_start": 0},
+            ],
+        }
+    )
+    assert r.status_code == 503
+    detail = r.json()["detail"]
+    assert detail[0]["code"] == "SEARCH_LIMIT_REACHED"
+
+
 def test_health():
     r = client.get("/health")
     assert r.status_code == 200

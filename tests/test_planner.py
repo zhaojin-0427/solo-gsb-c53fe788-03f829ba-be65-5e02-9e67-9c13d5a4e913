@@ -1,5 +1,6 @@
 """规划器算法级测试（不经过 HTTP）。"""
 
+import app.planner as planner
 from app.planner import Segment, plan_moves
 
 
@@ -86,5 +87,36 @@ check(
     run(6, [("A", 0, 2, 2), ("B", 2, 1, 0)]),
     [("B", 5), ("A", 2), ("B", 0)],
 )
+
+# 12 段可搬轮转：容量 13，ID "0".."11" 的长度 1 区段位于同号位置，
+# 目标 (i+1)%12，位置 12 空闲。借临时空位 13 步归位（写入=步数=13，
+# 恰等于下界：12 段各一次 + 含环 SCC 额外一次）。旧实现按 g 弹出退化为
+# 深度 BFS，触及状态上限误报无解；A* 目标导向后百余状态即收敛。
+# 字典序最小：首步停 "0"（字符串序 "0"<"1"<"10"<"11"<"2"<...），
+# 之后每步都被预算下界唯一确定。
+ROT = [(str(i), i, 1, (i + 1) % 12) for i in range(12)]
+check(
+    "rotation12",
+    run(13, ROT),
+    [
+        ("0", 12), ("11", 0), ("10", 11), ("9", 10), ("8", 9),
+        ("7", 8), ("6", 7), ("5", 6), ("4", 5), ("3", 4),
+        ("2", 3), ("1", 2), ("0", 1),
+    ],
+)
+
+# 搜索安全阀：把上限压到 1，应抛 SearchLimitReached（HTTP 层映射 503），
+# 而不是静默返回 None 误报无解。
+_orig_limit = planner._MAX_SEARCH_STATES
+planner._MAX_SEARCH_STATES = 1
+try:
+    planner.plan_moves(
+        5, [Segment("A", 0, 2, 2), Segment("B", 2, 1, 0)], []
+    )
+    raise AssertionError("search-limit: 未抛出 SearchLimitReached")
+except planner.SearchLimitReached:
+    print("OK  search-limit: SearchLimitReached raised")
+finally:
+    planner._MAX_SEARCH_STATES = _orig_limit
 
 print("\nall planner tests passed")

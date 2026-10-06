@@ -14,7 +14,8 @@
 3. 仍同分时，动作序列按 `(区段 ID, 目的起点)` 的**字典序最小**。
 
 已经全部在目标位置时返回**空序列**；不存在可行方案时返回
-`feasible=false`；非法输入返回 **422**。
+`feasible=false`；非法输入返回 **422**；搜索超出安全状态上限（极端病态
+实例，既未证最优也未证无解）返回 **503** 与错误码 `SEARCH_LIMIT_REACHED`。
 
 > 坐标为非负 64 位整数（容量最大 `2^64`，合法块坐标 `0 … 2^64-1`）。
 > 规划在**区间**层面进行，**不按卷容量逐块枚举**：复杂度只与区段数量有关，
@@ -110,7 +111,17 @@ PYTHONPATH=. uvicorn app.main:app --host 0.0.0.0 --port 8000
 - `moves` 即**按顺序重放**的搬移动作；第 `k` 步把 `segment_id` 复制到
   `[destination_start, destination_start+length)`。`length` 随每步回显，便于执行端核对。
 - 已全部到位：`{"feasible": true, "moves": []}`。
-- 无可行方案：`{"feasible": false, "moves": []}`。
+- 无可行方案（已证明）：`{"feasible": false, "moves": []}`。
+
+搜索超出安全状态上限（HTTP 503，与「已证无解」严格区分）：
+
+```json
+{
+  "detail": [
+    {"code": "SEARCH_LIMIT_REACHED", "message": "搜索状态数超出安全上限，未能在资源限额内给出已证最优的规划结果"}
+  ]
+}
+```
 
 非法输入（HTTP 422）：
 
@@ -125,7 +136,7 @@ PYTHONPATH=. uvicorn app.main:app --host 0.0.0.0 --port 8000
 典型错误码：`INVALID_REQUEST`（类型/范围/缺字段/多余字段）、
 `DUPLICATE_SEGMENT_ID`、`CURRENT_OVERLAP`、`TARGET_OVERLAP`、
 `SEGMENT_TOUCHES_RESERVED`、`RESERVED_OVERLAP`、`SEGMENT_OUT_OF_BOUNDS`、
-`RESERVED_OUT_OF_BOUNDS`。
+`RESERVED_OUT_OF_BOUNDS`、`SEARCH_LIMIT_REACHED`（503）。
 
 ---
 
@@ -245,6 +256,44 @@ curl -s -X POST http://localhost:8000/plans \
 {"feasible":true,"moves":[{"segment_id":"X","destination_start":0,"length":1}]}
 ```
 
+### 7) 12 段可搬轮转：借 1 个空位 13 步归位
+
+容量 13，ID 为 `"0"…"11"` 的 12 个长度 1 区段位于同号位置，目标为
+`(i+1)%12`，位置 12 空闲。这是一个 12 环 + 1 洞的死锁：必须先把一段
+停进空位，再依次让其余各段归位，最后收尾——最优写入 = 步数 = 13
+（恰等于「12 段各搬一次 + 破环额外一次」的下界）。字典序最小的首步是
+停 `"0"`（字符串序 `"0"<"1"<"10"<"11"<"2"<…`）。
+
+```bash
+curl -s -X POST http://localhost:8000/plans \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "capacity": 13,
+    "segments": [
+      {"id":"0","current_start":0,"length":1,"target_start":1},
+      {"id":"1","current_start":1,"length":1,"target_start":2},
+      {"id":"2","current_start":2,"length":1,"target_start":3},
+      {"id":"3","current_start":3,"length":1,"target_start":4},
+      {"id":"4","current_start":4,"length":1,"target_start":5},
+      {"id":"5","current_start":5,"length":1,"target_start":6},
+      {"id":"6","current_start":6,"length":1,"target_start":7},
+      {"id":"7","current_start":7,"length":1,"target_start":8},
+      {"id":"8","current_start":8,"length":1,"target_start":9},
+      {"id":"9","current_start":9,"length":1,"target_start":10},
+      {"id":"10","current_start":10,"length":1,"target_start":11},
+      {"id":"11","current_start":11,"length":1,"target_start":0}
+    ]
+  }'
+```
+
+```json
+{"feasible":true,"moves":[{"segment_id":"0","destination_start":12,"length":1},{"segment_id":"11","destination_start":0,"length":1},{"segment_id":"10","destination_start":11,"length":1},{"segment_id":"9","destination_start":10,"length":1},{"segment_id":"8","destination_start":9,"length":1},{"segment_id":"7","destination_start":8,"length":1},{"segment_id":"6","destination_start":7,"length":1},{"segment_id":"5","destination_start":6,"length":1},{"segment_id":"4","destination_start":5,"length":1},{"segment_id":"3","destination_start":4,"length":1},{"segment_id":"2","destination_start":3,"length":1},{"segment_id":"1","destination_start":2,"length":1},{"segment_id":"0","destination_start":1,"length":1}]}
+```
+
+重放过程：`"0"` 先停到 `[12,13)` → 洞移到 0，`"11"` 归位到 0 → 洞移到
+11，`"10"` 归位……依次到 `"1"` 归位到 2 → 洞移到 1，最后 `"0"` 从
+`[12,13)` 归位到 1，共 13 步。
+
 ---
 
 ## 算法与正确性
@@ -255,11 +304,26 @@ curl -s -X POST http://localhost:8000/plans \
 - 每个自由洞只需考察少量候选目的起点：洞的左右缘、区段自己的目标起点、
   以及与目标相切的 `target±length`；任何其它内部摆放都可在不增加写入与
   步数的情况下滑动到这些点，因此**不漏最优解**。
-- 搜索分两阶段：
-  1. 轻量 **Dijkstra**，代价 `(总写入块数, 步数)`，先求出最优值
-     `(W*, K*)`（用强连通分量下界与已归位增量做剪枝）；
-  2. 在预算 `(W*, K*)` 内做按 `(区段 ID, 目的起点)` 展开的有界 DFS，
-     第一个完整方案即字典序最小的最优序列。
+- 搜索分两阶段，先证最优值、再恢复字典序最小序列：
+  1. **A\*（允许重开）**：优先键 `f = g + h`，其中 `g = (已花写入, 已花步数)`，
+     `h` 为可接纳下界（见下）。目标首次以其最优 `g` 弹出即得全序最优值
+     `(W*, K*)`。同一状态只保留字典序最小的 `g`——状态相同则剩余最优
+     代价相同，较差前缀被严格占优（**归并规则一**）。若按 `g` 弹出则会
+     退化为按深度 BFS 排列空间（12 段环 + 1 洞的轮转即可耗尽状态上限），
+     按 `f` 弹出后目标导向，该轮转仅需约千次状态评估。
+  2. **预算内字典序 DFS**：在 `(W*, K*)` 内按 `(区段 ID, 目的起点)` 展开，
+     每个状态记录到达代价的 Pareto 前沿；被前沿某项按分量 `≤` 支配
+     （含相等）的新前缀直接剪掉——严格支配时它不可能在预算内完成，
+     相等时可选后缀完全相同而先到前缀字典序更小（**归并规则二**）。
+     第一个到达目标的完整方案即字典序最小的最优序列。
+- **可安全剪枝的下界**（两阶段共用）：每个未归位区段至少再整体搬一次
+  （写入 ≥ 未归位长度和、步数 ≥ 未归位段数）；依赖图（`u→v`：`u` 的目标
+  与 `v` 当前占用相交）中每个含环强连通分量至少再额外临时复制一次环内
+  最短区段。两组下界按分量相加仍可接纳，剪枝只丢「无论如何都超预算」的
+  分支，绝不提前返回未证最优的路径。
+- 搜索状态数设有安全阀（默认 50 万）；耗尽时抛 `SearchLimitReached`，
+  接口返回 **503 / SEARCH_LIMIT_REACHED**，与「已证无解」的
+  `feasible=false` 严格区分。
 - `tests/test_fuzz.py` 在数千个小规模随机实例上，将本规划器与
   **逐块枚举的暴力最优解**逐一比对（代价与字典序完全一致），并对返回序列做
   **逐块物理重放**校验（目的必须整块空闲、源目不重叠、复制后释放、最终到位）。
