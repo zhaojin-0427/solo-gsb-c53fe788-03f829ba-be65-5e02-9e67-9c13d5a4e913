@@ -6,7 +6,7 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from .planner import plan_moves
+from .planner import SearchLimitReached, plan_moves
 from .schemas import (
     ErrorEnvelope,
     PlanRequest,
@@ -57,6 +57,25 @@ async def request_validation_error_handler(
     )
 
 
+@app.exception_handler(SearchLimitReached)
+async def search_limit_handler(_: Request, exc: SearchLimitReached) -> JSONResponse:
+    # 区别于已证无解（200 + feasible=false）：这是“未能在资源上限内证明”。
+    return JSONResponse(
+        status_code=503,
+        content={
+            "detail": [
+                {
+                    "code": "SEARCH_LIMIT_REACHED",
+                    "message": (
+                        "搜索触及内部状态上限，未能在资源限额内证明可行或无解；"
+                        "该结果不代表无解。"
+                    ),
+                }
+            ]
+        },
+    )
+
+
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -65,7 +84,7 @@ async def health() -> dict[str, str]:
 @app.post(
     "/plans",
     response_model=PlanResponse,
-    responses={422: {"model": ErrorEnvelope}},
+    responses={422: {"model": ErrorEnvelope}, 503: {"model": ErrorEnvelope}},
     summary="生成区段安全搬移序列",
 )
 async def create_plan(req: PlanRequest) -> PlanResponse:

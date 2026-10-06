@@ -1,6 +1,8 @@
 """规划器算法级测试（不经过 HTTP）。"""
 
-from app.planner import Segment, plan_moves
+import pytest
+
+from app.planner import Segment, SearchLimitReached, plan_moves
 
 
 def run(cap, segs, reserved=None):
@@ -86,5 +88,67 @@ check(
     run(6, [("A", 0, 2, 2), ("B", 2, 1, 0)]),
     [("B", 5), ("A", 2), ("B", 0)],
 )
+
+
+def _replay(cap, segs, moves):
+    """逐块重放：目的整块空闲、源目不重叠、复制后释放、最终全部到位。"""
+    grid = [None] * cap
+    length = {}
+    for sid, c, l, t in segs:
+        for x in range(c, c + l):
+            assert grid[x] is None
+            grid[x] = sid
+        length[sid] = l
+    for sid, dest in moves:
+        l = length[sid]
+        src = grid.index(sid)
+        for x in range(dest, dest + l):
+            assert grid[x] is None, f"目的块 {x} 非空闲（{grid[x]}）"
+        assert not (dest < src + l and src < dest + l), "源目重叠"
+        for x in range(dest, dest + l):
+            grid[x] = sid
+        for x in range(src, src + l):
+            if not (dest <= x < dest + l):
+                grid[x] = None
+    for sid, c, l, t in segs:
+        for x in range(t, t + l):
+            assert grid[x] == sid
+
+
+def test_rotate12_borrow_single_hole_13_steps():
+    # 容量 13：12 个长度 1 区段在 0..11，目标 (i+1)%12，位置 12 空闲。
+    cap = 13
+    segs = [(str(i), i, 1, (i + 1) % 12) for i in range(12)]
+    moves = plan_moves(cap, [Segment(*s) for s in segs], [])
+    assert moves is not None
+    assert len(moves) == 13  # 借空位 1 步 + 11 段归位 + 借位段归位
+    # 写入最优：12 段各归位一次 + 环的一次额外复制 = 13 块
+    total_write = sum(
+        next(l for s2, _, l, _ in segs if s2 == sid) for sid, _ in moves
+    )
+    assert total_write == 13
+    _replay(cap, segs, moves)
+
+
+def test_search_limit_raises_instead_of_false_infeasible():
+    # 轮转需要远超 10 个状态：资源耗尽必须抛 SearchLimitReached，不能误报无解。
+    cap = 13
+    segs = [(str(i), i, 1, (i + 1) % 12) for i in range(12)]
+    with pytest.raises(SearchLimitReached):
+        plan_moves(cap, [Segment(*s) for s in segs], [], max_states=10)
+
+
+def test_proven_infeasible_returns_none_even_with_tiny_limit():
+    # 容量占满的互换没有任何合法动作，堆立即耗尽：这是已证无解而非资源不足。
+    assert (
+        plan_moves(
+            2,
+            [Segment("A", 0, 1, 1), Segment("B", 1, 1, 0)],
+            [],
+            max_states=1,
+        )
+        is None
+    )
+
 
 print("\nall planner tests passed")

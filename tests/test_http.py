@@ -3,6 +3,7 @@
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app.planner import SearchLimitReached
 
 client = TestClient(app)
 
@@ -202,6 +203,60 @@ def test_422_when_capacity_exceeds_uint64_coordinate_space():
         }
     )
     assert r.status_code == 422
+
+
+def test_rotate12_returns_replayable_13_steps():
+    # 容量 13，12 个长度 1 区段轮转 (i+1)%12，位置 12 空闲：13 步借洞归位。
+    body = {
+        "capacity": 13,
+        "segments": [
+            {
+                "id": str(i),
+                "current_start": i,
+                "length": 1,
+                "target_start": (i + 1) % 12,
+            }
+            for i in range(12)
+        ],
+    }
+    r = post(body)
+    assert r.status_code == 200, r.text
+    moves = r.json()["moves"]
+    assert r.json()["feasible"] is True
+    assert len(moves) == 13
+
+    # 逐块重放：源目不重叠、目的整块空闲、复制后释放、最终到位。
+    grid = [None] * 13
+    for i in range(12):
+        grid[i] = str(i)
+    for m in moves:
+        sid = m["segment_id"]
+        dest = m["destination_start"]
+        assert m["length"] == 1
+        src = grid.index(sid)
+        assert grid[dest] is None, (sid, dest, grid[dest])
+        assert src != dest
+        grid[dest] = sid
+        grid[src] = None
+    for i in range(12):
+        assert grid[(i + 1) % 12] == str(i)
+
+
+def test_503_when_search_limit_reached(monkeypatch):
+    def boom(*_args, **_kwargs):
+        raise SearchLimitReached
+
+    monkeypatch.setattr("app.main.plan_moves", boom)
+    r = post(
+        {
+            "capacity": 3,
+            "segments": [
+                {"id": "A", "current_start": 0, "length": 1, "target_start": 1}
+            ],
+        }
+    )
+    assert r.status_code == 503
+    assert r.json()["detail"][0]["code"] == "SEARCH_LIMIT_REACHED"
 
 
 def test_health():
